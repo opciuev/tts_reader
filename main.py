@@ -36,6 +36,7 @@ class TTSReader:
         self.is_converted = False  # 是否已转换
         self.is_converting = False  # 是否正在转换
         self.temp_files = []
+        self.is_continuous_play = False  # 是否为连续播放模式
         
         self.setup_ui()
         
@@ -456,7 +457,7 @@ class TTSReader:
         """点击文本播放对应句子"""
         if not self.is_converted or not self.sentences:
             return
-            
+        
         # 获取点击位置
         index = self.text_widget.index(tk.CURRENT)
         clicked_text = self.text_widget.get(1.0, index)
@@ -466,8 +467,8 @@ class TTSReader:
         for i, sentence in enumerate(self.sentences):
             char_count += len(sentence)
             if char_count >= len(clicked_text):
-                self.current_sentence = i
-                self.play_single_sentence(i)  # 只播放单句
+                # 播放单句（会自动重置状态）
+                self.play_single_sentence(i)
                 break
     
     def on_text_hover(self, event):
@@ -481,10 +482,17 @@ class TTSReader:
         """播放单个句子"""
         if not self.is_converted or sentence_index >= len(self.audio_files):
             return
-            
-        self.stop_play()  # 停止当前播放
+        
+        # 重置状态
+        self.stop_play()
         self.current_sentence = sentence_index
         self.is_playing = True
+        self.is_paused = False
+        self.is_continuous_play = False  # 标记为单句播放模式
+        
+        # 清除所有标记
+        self.text_widget.tag_remove("current", 1.0, tk.END)
+        self.text_widget.tag_remove("completed", 1.0, tk.END)
         
         # 高亮当前句子
         self.highlight_current_sentence()
@@ -501,14 +509,14 @@ class TTSReader:
     
     def monitor_single_play(self):
         """监控单句播放完成"""
-        if pygame.mixer.music.get_busy() and self.is_playing:
+        if pygame.mixer.music.get_busy() and self.is_playing and not self.is_paused:
             # 还在播放，继续监控
             self.root.after(100, self.monitor_single_play)
-        elif self.is_playing:
-            # 播放完成，停止播放
+        elif self.is_playing and not self.is_paused:
+            # 单句播放完成，重置状态
             self.is_playing = False
-            self.update_button_states()
             self.text_widget.tag_remove("current", 1.0, tk.END)
+            self.update_button_states()
             self.status_label.config(text="状态: 播放完成")
     
     def play_from_sentence(self, sentence_index):
@@ -525,19 +533,34 @@ class TTSReader:
         """从第一句开始连续播放"""
         if not self.is_converted:
             return
+        
+        # 重置状态
+        self.stop_play()
         self.current_sentence = 0
         self.is_playing = True
+        self.is_paused = False
+        self.is_continuous_play = True  # 标记为连续播放模式
+        
+        # 清除所有标记
+        self.text_widget.tag_remove("current", 1.0, tk.END)
+        self.text_widget.tag_remove("completed", 1.0, tk.END)
+        
         self.play_current_and_continue()
     
     def play_current_and_continue(self):
         """播放当前句子并继续下一句"""
         if not self.is_playing or self.current_sentence >= len(self.sentences):
+            # 播放完成，重置状态
             self.is_playing = False
+            self.is_paused = False
+            self.is_continuous_play = False
+            self.text_widget.tag_remove("current", 1.0, tk.END)
             self.update_button_states()
             self.status_label.config(text="状态: 播放完成")
             return
-            
+        
         if self.is_paused:
+            # 从暂停状态恢复
             pygame.mixer.music.unpause()
             self.is_paused = False
             self.status_label.config(text="状态: 继续播放")
@@ -559,10 +582,10 @@ class TTSReader:
     
     def monitor_and_continue(self):
         """监控播放完成并自动播放下一句"""
-        if pygame.mixer.music.get_busy() and self.is_playing:
+        if pygame.mixer.music.get_busy() and self.is_playing and not self.is_paused:
             # 还在播放，继续监控
             self.root.after(100, self.monitor_and_continue)
-        elif self.is_playing:
+        elif self.is_playing and not self.is_paused:
             # 播放完成，标记当前句子并播放下一句
             self.mark_sentence_completed()
             self.current_sentence += 1
@@ -611,49 +634,77 @@ class TTSReader:
     
     def pause_play(self):
         """暂停播放"""
-        pygame.mixer.music.pause()
-        self.is_paused = True
-        self.update_button_states()
-        self.status_label.config(text="状态: 已暂停")
+        if self.is_playing and not self.is_paused:
+            pygame.mixer.music.pause()
+            self.is_paused = True
+            self.update_button_states()
+            self.status_label.config(text="状态: 已暂停")
     
     def stop_play(self):
         """停止播放"""
         self.is_playing = False
         self.is_paused = False
+        self.is_continuous_play = False
         pygame.mixer.music.stop()
-        self.update_button_states()
+        
+        # 清除所有高亮标记
         self.text_widget.tag_remove("current", 1.0, tk.END)
+        self.text_widget.tag_remove("completed", 1.0, tk.END)
+        
+        self.update_button_states()
         self.status_label.config(text="状态: 已停止")
     
     def update_button_states(self):
         """更新按钮状态"""
         if self.is_converting:
+            # 转换中：禁用所有按钮
             self.convert_btn.config(state="disabled")
             self.save_btn.config(state="disabled")
             self.play_btn.config(state="disabled")
             self.pause_btn.config(state="disabled")
             self.stop_btn.config(state="disabled")
         elif self.is_converted:
+            # 已转换完成
             self.convert_btn.config(state="normal")
             self.save_btn.config(state="normal")
+            
             if self.is_playing:
                 if self.is_paused:
-                    self.play_btn.config(text="继续", state="normal")
+                    # 暂停状态：显示继续按钮
+                    self.play_btn.config(text="继续", state="normal", command=self.resume_play)
                     self.pause_btn.config(state="disabled")
+                    self.stop_btn.config(state="normal")
                 else:
-                    self.play_btn.config(state="disabled")
+                    # 播放状态：禁用播放，启用暂停和停止
+                    self.play_btn.config(text="播放", state="disabled", command=self.play_all)
                     self.pause_btn.config(state="normal")
-                self.stop_btn.config(state="normal")
+                    self.stop_btn.config(state="normal")
             else:
-                self.play_btn.config(text="播放", state="normal")
+                # 停止状态：启用播放，禁用暂停和停止
+                self.play_btn.config(text="播放", state="normal", command=self.play_all)
                 self.pause_btn.config(state="disabled")
                 self.stop_btn.config(state="disabled")
         else:
+            # 未转换：只启用转换按钮
             self.convert_btn.config(state="normal")
             self.save_btn.config(state="disabled")
             self.play_btn.config(state="disabled")
             self.pause_btn.config(state="disabled")
             self.stop_btn.config(state="disabled")
+    
+    def resume_play(self):
+        """恢复播放"""
+        if self.is_paused:
+            self.is_paused = False
+            if self.is_continuous_play:
+                # 连续播放模式：继续播放当前句子
+                self.play_current_and_continue()
+            else:
+                # 单句播放模式：继续播放当前句子
+                pygame.mixer.music.unpause()
+                self.update_button_states()
+                self.status_label.config(text=f"状态: 继续播放第{self.current_sentence+1}句")
+                self.monitor_single_play()
     
     def cleanup_temp_files(self):
         """清理临时文件"""
@@ -713,6 +764,8 @@ if __name__ == "__main__":
     app = TTSReader(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
+
+
 
 
 
