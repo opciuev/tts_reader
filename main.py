@@ -178,17 +178,51 @@ class TTSReader:
         self.text_widget.bind("<Button-1>", self.on_text_click)
         self.text_widget.bind("<Motion>", self.on_text_hover)
         self.text_widget.bind("<KeyRelease>", self.on_text_change)
-        self.text_widget.bind("<ButtonRelease>", self.on_text_change)
-        
+        # 移除ButtonRelease绑定，避免点击时误触发
+    
+    def format_rate_value(self):
+        """格式化语速值"""
+        try:
+            value = int(float(self.rate_var.get().replace('%', '')))
+            self.rate_var.set(f"{value}%")
+        except:
+            self.rate_var.set("0%")
+    
+    def format_volume_value(self):
+        """格式化音量值"""
+        try:
+            value = int(float(self.volume_var.get().replace('%', '')))
+            self.volume_var.set(f"{value}%")
+        except:
+            self.volume_var.set("0%")
+    
+    def format_pitch_value(self):
+        """格式化音调值"""
+        try:
+            value = int(float(self.pitch_var.get().replace('Hz', '')))
+            self.pitch_var.set(f"{value}Hz")
+        except:
+            self.pitch_var.set("0Hz")
+    
     def on_text_change(self, event=None):
         """文本内容改变时的处理"""
-        # 自动分割句子
-        self.split_sentences()
-        # 如果已经转换过，重置转换状态
-        if self.is_converted:
-            self.reset_conversion_state()
-            self.status_label.config(text="状态: 文本已更改，需重新转换")
+        # 防止在处理过程中重复触发
+        if hasattr(self, '_processing_text_change') and self._processing_text_change:
+            return
         
+        self._processing_text_change = True
+        
+        try:
+            # 自动分割句子
+            self.split_sentences()
+            # 如果已经转换过，重置转换状态
+            if self.is_converted:
+                self.reset_conversion_state()
+                self.status_label.config(text="状态: 文本已更改，需重新转换")
+        finally:
+            # 延迟重置标志，避免连续触发
+            self.root.after(100, lambda: setattr(self, '_processing_text_change', False))
+    
     def read_clipboard(self):
         """读取剪贴板内容"""
         try:
@@ -209,8 +243,17 @@ class TTSReader:
             self.progress_label.config(text="句子: 0句")
             return
             
-        # 按句号、问号、感叹号、换行分割
-        sentences = re.split(r'[。！？\n]+', text)
+        # 根据当前语音类型选择分割规则
+        if self.voice.startswith("ja-JP"):
+            # 日语分割：句号、问号、感叹号、换行、日语句号
+            sentences = re.split(r'[。！？\n．]+', text)
+        elif self.voice.startswith("en-US"):
+            # 英语分割：句号、问号、感叹号、换行
+            sentences = re.split(r'[.!?\n]+', text)
+        else:
+            # 中文分割：句号、问号、感叹号、换行
+            sentences = re.split(r'[。！？\n]+', text)
+            
         self.sentences = [s.strip() for s in sentences if s.strip()]
         self.current_sentence = 0
         
@@ -227,6 +270,9 @@ class TTSReader:
         self.is_converted = False
         self.audio_files = []
         self.cleanup_temp_files()
+        # 重置进度条和进度标签
+        self.progress_var.set(0)
+        self.progress_label.config(text=f"句子: {len(self.sentences)}句")
         self.update_button_states()
     
     def on_voice_change(self, event):
@@ -266,11 +312,10 @@ class TTSReader:
     
     async def convert_single_sentence(self, sentence, index):
         """转换单个句子"""
-        # 生成临时音频文件
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
         temp_file.close()
         
-        # TTS转换
+        # 直接使用纯文本，不使用SSML
         communicate = edge_tts.Communicate(sentence, self.voice)
         await communicate.save(temp_file.name)
         
@@ -589,5 +634,15 @@ if __name__ == "__main__":
     app = TTSReader(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
+
+
+
+
+
+
+
+
+
+
 
 
