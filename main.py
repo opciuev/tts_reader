@@ -470,9 +470,9 @@ class TTSReader:
         self.audio_files = [None] * total_sentences
         self.temp_files = []
         
-        # 降低并发数，提高成功率
-        max_workers = min(4, int(self.thread_var.get()))  # 最多4个并发
-        logger.info(f"使用 {max_workers} 个并发线程（优化后）")
+        # 使用界面上设置的线程数
+        max_workers = int(self.thread_var.get())
+        logger.info(f"使用 {max_workers} 个并发线程")
         
         # 创建任务
         tasks = []
@@ -489,7 +489,7 @@ class TTSReader:
         
         # 批量执行，添加延迟
         completed = 0
-        batch_size = 2  # 每批2个任务
+        batch_size = max(2, max_workers // 2)  # 根据线程数调整批次大小
         
         for i in range(0, len(tasks), batch_size):
             batch = tasks[i:i+batch_size]
@@ -520,7 +520,7 @@ class TTSReader:
             
             # 批次间延迟，避免请求过于密集
             if i + batch_size < len(tasks):
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
         
         # 清理会话
         if self.session and not self.session.closed:
@@ -541,26 +541,52 @@ class TTSReader:
     
     def save_audio(self):
         """保存音频文件"""
-        if not self.is_converted or not self.audio_files:
+        logger.info(f"保存按钮被点击 - is_converted: {self.is_converted}, audio_files数量: {len(self.audio_files)}")
+        
+        if not self.is_converted:
+            logger.warning("保存失败：未转换状态")
             messagebox.showwarning("警告", "请先转换文本")
             return
+            
+        if not self.audio_files:
+            logger.warning("保存失败：音频文件列表为空")
+            messagebox.showwarning("警告", "没有可保存的音频文件")
+            return
+        
+        # 检查音频文件是否存在
+        valid_files = []
+        for i, audio_file in enumerate(self.audio_files):
+            if audio_file and os.path.exists(audio_file):
+                valid_files.append(audio_file)
+                logger.debug(f"音频文件 {i+1} 存在: {audio_file}")
+            else:
+                logger.warning(f"音频文件 {i+1} 不存在或为空: {audio_file}")
+        
+        if not valid_files:
+            logger.error("保存失败：没有有效的音频文件")
+            messagebox.showerror("错误", "没有有效的音频文件可保存")
+            return
+        
+        logger.info(f"找到 {len(valid_files)} 个有效音频文件，开始保存...")
         
         # 生成默认文件名
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         default_filename = f"{timestamp}.mp3"
         
-        # 选择保存文件
+        # 选择保存文件 - 修复参数名
         save_path = filedialog.asksaveasfilename(
             title="保存合并音频",
             defaultextension=".mp3",
-            initialvalue=default_filename,
+            initialfile=default_filename,  # 修改为 initialfile
             filetypes=[("MP3 files", "*.mp3"), ("All files", "*.*")]
         )
         
         if not save_path:
+            logger.info("用户取消了保存操作")
             return
         
         try:
+            logger.info(f"开始合并音频到: {save_path}")
             # 合并所有音频为一个文件
             self.combine_audio_files(save_path)
             
@@ -570,18 +596,25 @@ class TTSReader:
                 base_name = os.path.splitext(os.path.basename(save_path))[0]
                 
                 # 保存单个句子音频
+                saved_count = 0
                 for i, (sentence, audio_file) in enumerate(zip(self.sentences, self.audio_files)):
-                    safe_sentence = re.sub(r'[^\w\s-]', '', sentence[:20])  # 取前20个字符
-                    safe_sentence = re.sub(r'[-\s]+', '_', safe_sentence)
-                    filename = f"{base_name}_第{i+1:03d}句_{safe_sentence}.mp3"
-                    single_save_path = os.path.join(save_dir, filename)
-                    shutil.copy2(audio_file, single_save_path)
+                    if audio_file and os.path.exists(audio_file):
+                        safe_sentence = re.sub(r'[^\w\s-]', '', sentence[:20])  # 取前20个字符
+                        safe_sentence = re.sub(r'[-\s]+', '_', safe_sentence)
+                        filename = f"{base_name}_第{i+1:03d}句_{safe_sentence}.mp3"
+                        single_save_path = os.path.join(save_dir, filename)
+                        shutil.copy2(audio_file, single_save_path)
+                        saved_count += 1
+                        logger.debug(f"保存单句音频: {single_save_path}")
                 
-                messagebox.showinfo("成功", f"音频已保存:\n主文件: {save_path}\n单句文件: {len(self.audio_files)}个")
+                logger.info(f"保存完成 - 主文件: {save_path}, 单句文件: {saved_count}个")
+                messagebox.showinfo("成功", f"音频已保存:\n主文件: {save_path}\n单句文件: {saved_count}个")
             else:
+                logger.info(f"保存完成 - 仅主文件: {save_path}")
                 messagebox.showinfo("成功", f"音频已保存: {save_path}")
             
         except Exception as e:
+            logger.error(f"保存失败: {str(e)}", exc_info=True)
             messagebox.showerror("错误", f"保存失败: {str(e)}")
     
     def combine_audio_files(self, output_path):
