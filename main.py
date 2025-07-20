@@ -9,6 +9,8 @@ import tempfile
 import os
 import shutil
 from datetime import datetime
+import concurrent.futures
+import multiprocessing
 
 class TTSReader:
     def __init__(self, root):
@@ -29,6 +31,9 @@ class TTSReader:
         self.is_converting = False  # 是否正在转换
         self.temp_files = []
         self.voice = "zh-CN-XiaoxiaoNeural"
+        
+        # 自适应线程数：CPU核心数的2倍，但不超过8个
+        self.max_workers = min(8, max(2, multiprocessing.cpu_count() * 2))
         
         self.setup_ui()
         
@@ -98,6 +103,12 @@ class TTSReader:
         voice_combo.pack(side=tk.LEFT, padx=(5,10))
         voice_combo.bind('<<ComboboxSelected>>', self.on_voice_change)
         
+        # 线程数设置
+        ttk.Label(control_frame, text="线程数:").pack(side=tk.LEFT, padx=(10,0))
+        self.thread_var = tk.StringVar(value=str(self.max_workers))
+        thread_spinbox = tk.Spinbox(control_frame, from_=1, to=16, width=3, textvariable=self.thread_var)
+        thread_spinbox.pack(side=tk.LEFT, padx=(5,0))
+        
         # 第一行按钮
         button_frame1 = ttk.Frame(main_frame)
         button_frame1.pack(fill=tk.X, pady=(0,5))
@@ -118,7 +129,7 @@ class TTSReader:
         button_frame2.pack(fill=tk.X, pady=(0,10))
         
         # 播放控制按钮
-        self.play_btn = ttk.Button(button_frame2, text="播放当前", command=self.play_current, state="disabled")
+        self.play_btn = ttk.Button(button_frame2, text="播放", command=self.play_all, state="disabled")
         self.play_btn.pack(side=tk.LEFT, padx=(0,5))
         
         self.pause_btn = ttk.Button(button_frame2, text="暂停", command=self.pause_play, state="disabled")
@@ -126,9 +137,6 @@ class TTSReader:
         
         self.stop_btn = ttk.Button(button_frame2, text="停止", command=self.stop_play, state="disabled")
         self.stop_btn.pack(side=tk.LEFT, padx=(0,5))
-        
-        self.play_all_btn = ttk.Button(button_frame2, text="连续播放", command=self.play_all, state="disabled")
-        self.play_all_btn.pack(side=tk.LEFT)
         
         # 状态显示
         status_frame = ttk.Frame(main_frame)
@@ -249,45 +257,69 @@ class TTSReader:
     def process_conversion(self):
         """处理TTS转换"""
         try:
-            asyncio.run(self.convert_all_sentences())
+            asyncio.run(self.convert_all_sentences_parallel())
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("错误", f"转换失败: {str(e)}"))
         finally:
             self.is_converting = False
             self.root.after(0, self.update_button_states)
     
-    async def convert_all_sentences(self):
-        """转换所有句子为音频文件"""
-        total_sentences = len(self.sentences)
-        self.audio_files = []
+    async def convert_single_sentence(self, sentence, index):
+        """转换单个句子"""
+        # 生成临时音频文件
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+        temp_file.close()
         
+        # TTS转换
+        communicate = edge_tts.Communicate(sentence, self.voice)
+        await communicate.save(temp_file.name)
+        
+        return index, temp_file.name
+    
+    async def convert_all_sentences_parallel(self):
+        """并行转换所有句子为音频文件"""
+        total_sentences = len(self.sentences)
+        self.audio_files = [None] * total_sentences  # 预分配数组
+        self.temp_files = []
+        
+        # 获取线程数
+        max_workers = int(self.thread_var.get())
+        
+        # 创建任务列表
+        tasks = []
         for i, sentence in enumerate(self.sentences):
+            task = self.convert_single_sentence(sentence, i)
+            tasks.append(task)
+        
+        # 使用信号量限制并发数
+        semaphore = asyncio.Semaphore(max_workers)
+        
+        async def limited_convert(task):
+            async with semaphore:
+                return await task
+        
+        # 并行执行转换
+        completed = 0
+        for coro in asyncio.as_completed([limited_convert(task) for task in tasks]):
             if not self.is_converting:
                 break
                 
+            index, temp_file_path = await coro
+            self.audio_files[index] = temp_file_path
+            self.temp_files.append(temp_file_path)
+            
+            completed += 1
+            
             # 更新UI
-            self.root.after(0, lambda i=i: self.status_label.config(text=f"状态: 转换中... ({i+1}/{total_sentences})"))
-            self.root.after(0, lambda i=i: self.progress_var.set((i/total_sentences)*100))
-            self.root.after(0, lambda i=i: self.progress_label.config(text=f"转换: {i+1}/{total_sentences}"))
-            
-            # 生成临时音频文件
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
-            temp_file.close()
-            self.temp_files.append(temp_file.name)
-            
-            # TTS转换
-            communicate = edge_tts.Communicate(sentence, self.voice)
-            await communicate.save(temp_file.name)
-            
-            self.audio_files.append(temp_file.name)
-            
-            # 标记句子为已转换
-            self.root.after(0, lambda i=i: self.mark_sentence_converted(i))
+            self.root.after(0, lambda c=completed: self.status_label.config(text=f"状态: 转换中... ({c}/{total_sentences})"))
+            self.root.after(0, lambda c=completed: self.progress_var.set((c/total_sentences)*100))
+            self.root.after(0, lambda c=completed: self.progress_label.config(text=f"转换: {c}/{total_sentences}"))
+            self.root.after(0, lambda i=index: self.mark_sentence_converted(i))
         
         # 转换完成
         if self.is_converting:
             self.is_converted = True
-            self.root.after(0, lambda: self.status_label.config(text="状态: 转换完成，可以播放"))
+            self.root.after(0, lambda: self.status_label.config(text=f"状态: 转换完成，使用{max_workers}个线程"))
             self.root.after(0, lambda: self.progress_var.set(100))
             self.root.after(0, self.make_sentences_clickable)
     
@@ -381,7 +413,7 @@ class TTSReader:
             char_count += len(sentence)
             if char_count >= len(clicked_text):
                 self.current_sentence = i
-                self.play_sentence(i)
+                self.play_from_sentence(i)
                 break
     
     def on_text_hover(self, event):
@@ -391,84 +423,63 @@ class TTSReader:
         else:
             self.text_widget.config(cursor="xterm")
     
-    def play_sentence(self, sentence_index):
-        """播放指定句子"""
+    def play_from_sentence(self, sentence_index):
+        """从指定句子开始连续播放"""
         if not self.is_converted or sentence_index >= len(self.audio_files):
             return
             
         self.stop_play()  # 停止当前播放
         self.current_sentence = sentence_index
-        
-        # 高亮当前句子
-        self.highlight_current_sentence()
-        
-        # 播放音频
-        pygame.mixer.music.load(self.audio_files[sentence_index])
-        pygame.mixer.music.play()
-        
         self.is_playing = True
-        self.update_button_states()
-        self.status_label.config(text=f"状态: 播放第{sentence_index+1}句")
+        self.play_current_and_continue()
         
-        # 监控播放完成
-        self.monitor_playback()
-    
-    def play_current(self):
-        """播放当前句子"""
+    def play_all(self):
+        """从第一句开始连续播放"""
         if not self.is_converted:
+            return
+        self.current_sentence = 0
+        self.is_playing = True
+        self.play_current_and_continue()
+    
+    def play_current_and_continue(self):
+        """播放当前句子并继续下一句"""
+        if not self.is_playing or self.current_sentence >= len(self.sentences):
+            self.is_playing = False
+            self.update_button_states()
+            self.status_label.config(text="状态: 播放完成")
             return
             
         if self.is_paused:
             pygame.mixer.music.unpause()
             self.is_paused = False
             self.status_label.config(text="状态: 继续播放")
-        else:
-            self.play_sentence(self.current_sentence)
-        self.update_button_states()
-    
-    def play_all(self):
-        """连续播放所有句子"""
-        if not self.is_converted:
+            self.update_button_states()
             return
-        self.current_sentence = 0
-        self.is_playing = True
-        self.play_continuous()
+        
+        # 高亮当前句子
+        self.highlight_current_sentence()
+        
+        # 播放音频
+        pygame.mixer.music.load(self.audio_files[self.current_sentence])
+        pygame.mixer.music.play()
+        
+        self.update_button_states()
+        self.status_label.config(text=f"状态: 播放第{self.current_sentence+1}句")
+        
+        # 监控播放完成并自动播放下一句
+        self.monitor_and_continue()
     
-    def play_continuous(self):
-        """连续播放模式"""
-        if self.current_sentence < len(self.sentences) and self.is_playing:
-            self.play_sentence(self.current_sentence)
-            # 设置定时器检查播放完成后播放下一句
-            self.root.after(100, self.check_and_play_next)
-    
-    def check_and_play_next(self):
-        """检查并播放下一句"""
-        if not pygame.mixer.music.get_busy() and self.is_playing:
+    def monitor_and_continue(self):
+        """监控播放完成并自动播放下一句"""
+        if pygame.mixer.music.get_busy() and self.is_playing:
+            # 还在播放，继续监控
+            self.root.after(100, self.monitor_and_continue)
+        elif self.is_playing:
+            # 播放完成，标记当前句子并播放下一句
             self.mark_sentence_completed()
             self.current_sentence += 1
-            if self.current_sentence < len(self.sentences):
-                # 继续播放下一句
-                self.root.after(500, self.play_continuous)  # 稍微延迟避免音频切换问题
-            else:
-                self.is_playing = False
-                self.update_button_states()
-                self.status_label.config(text="状态: 连续播放完成")
-        elif self.is_playing:
-            self.root.after(100, self.check_and_play_next)
-    
-    def monitor_playback(self):
-        """监控单句播放完成"""
-        if pygame.mixer.music.get_busy() and self.is_playing:
-            self.root.after(100, self.monitor_playback)
-        elif self.is_playing:
-            # 检查是否是连续播放模式
-            if hasattr(self, '_continuous_mode') and self._continuous_mode:
-                return  # 连续播放模式由check_and_play_next处理
-            
-            self.is_playing = False
-            self.update_button_states()
-            self.mark_sentence_completed()
-            self.status_label.config(text="状态: 播放完成")
+            # 稍微延迟后播放下一句
+            self.root.after(300, self.play_current_and_continue)
     
     def highlight_current_sentence(self):
         """高亮当前句子"""
@@ -534,7 +545,6 @@ class TTSReader:
             self.play_btn.config(state="disabled")
             self.pause_btn.config(state="disabled")
             self.stop_btn.config(state="disabled")
-            self.play_all_btn.config(state="disabled")
         elif self.is_converted:
             self.convert_btn.config(state="normal")
             self.save_btn.config(state="normal")
@@ -546,19 +556,16 @@ class TTSReader:
                     self.play_btn.config(state="disabled")
                     self.pause_btn.config(state="normal")
                 self.stop_btn.config(state="normal")
-                self.play_all_btn.config(state="disabled")
             else:
-                self.play_btn.config(text="播放当前", state="normal")
+                self.play_btn.config(text="播放", state="normal")
                 self.pause_btn.config(state="disabled")
                 self.stop_btn.config(state="disabled")
-                self.play_all_btn.config(state="normal")
         else:
             self.convert_btn.config(state="normal")
             self.save_btn.config(state="disabled")
             self.play_btn.config(state="disabled")
             self.pause_btn.config(state="disabled")
             self.stop_btn.config(state="disabled")
-            self.play_all_btn.config(state="disabled")
     
     def cleanup_temp_files(self):
         """清理临时文件"""
@@ -582,4 +589,5 @@ if __name__ == "__main__":
     app = TTSReader(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
+
 
