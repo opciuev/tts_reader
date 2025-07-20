@@ -8,8 +8,22 @@ import tempfile
 import os
 import shutil
 import re
+import time
+import logging
 from datetime import datetime
 from config import Config
+import aiohttp
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('tts_debug.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 class TTSReader:
     def __init__(self, root):
@@ -38,6 +52,7 @@ class TTSReader:
         self.temp_files = []
         self.is_continuous_play = False  # 是否为连续播放模式
         self.last_text_content = ""  # 记录上次的文本内容
+        self.session = None  # 添加会话复用
         
         self.setup_ui()
         
@@ -253,6 +268,7 @@ class TTSReader:
     
     def split_sentences(self):
         """将文本分割为句子"""
+        start_time = time.time()
         text = self.text_widget.get(1.0, tk.END).strip()
         if not text:
             self.sentences = []
@@ -280,6 +296,9 @@ class TTSReader:
         self.text_widget.tag_remove("clickable", 1.0, tk.END)
         
         self.progress_label.config(text=f"句子: {len(self.sentences)}句")
+        
+        split_time = time.time() - start_time
+        logger.info(f"文本分割完成，耗时: {split_time*1000:.1f}ms，分割出 {len(self.sentences)} 个句子")
     
     def reset_conversion_state(self):
         """重置转换状态"""
@@ -301,112 +320,224 @@ class TTSReader:
     
     def convert_text(self):
         """开始转换文本为音频"""
+        start_time = time.time()
+        logger.info("=== 开始转换流程 ===")
+        
         # 快速检查
         if not self.text_widget.get(1.0, tk.END).strip():
             messagebox.showwarning("警告", "请先输入文本")
             return
+        
+        logger.info(f"文本检查完成，耗时: {(time.time() - start_time)*1000:.1f}ms")
         
         # 立即更新状态，避免用户等待
         self.is_converting = True
         self.update_button_states()
         self.status_label.config(text="状态: 准备转换...")
         
+        logger.info(f"UI状态更新完成，耗时: {(time.time() - start_time)*1000:.1f}ms")
+        
         # 立即启动线程，减少延迟
         thread = threading.Thread(target=self.process_conversion)
         thread.daemon = True
         thread.start()
+        
+        logger.info(f"线程启动完成，总耗时: {(time.time() - start_time)*1000:.1f}ms")
     
     def process_conversion(self):
         """处理TTS转换"""
+        process_start = time.time()
+        logger.info("=== 进入转换线程 ===")
+        
         try:
             # 在线程中进行文本分割，避免阻塞UI
+            ui_start = time.time()
             self.root.after(0, lambda: self.status_label.config(text="状态: 分析文本..."))
+            logger.debug(f"UI状态更新耗时: {(time.time() - ui_start)*1000:.1f}ms")
             
             # 确保获取最新的文本内容并分割
+            text_start = time.time()
             text = self.text_widget.get(1.0, tk.END).strip()
+            logger.info(f"获取文本内容耗时: {(time.time() - text_start)*1000:.1f}ms，文本长度: {len(text)}")
+            
             if not text:
                 self.root.after(0, lambda: messagebox.showwarning("警告", "文本为空"))
                 return
             
             # 在主线程中分割句子
+            split_start = time.time()
             self.root.after(0, self.split_sentences)
             
             # 等待分割完成
-            import time
             time.sleep(0.1)
+            logger.info(f"句子分割耗时: {(time.time() - split_start)*1000:.1f}ms，句子数量: {len(self.sentences)}")
             
             if not self.sentences:
                 self.root.after(0, lambda: messagebox.showwarning("警告", "无法分割句子"))
                 return
             
+            # 显示句子信息
+            for i, sentence in enumerate(self.sentences):
+                logger.debug(f"句子 {i+1}: {sentence[:50]}...")
+            
             self.root.after(0, lambda: self.status_label.config(text="状态: 开始转换..."))
             
             # 开始异步转换
+            async_start = time.time()
+            logger.info("开始异步转换...")
+            
+            # 检查网络连接
+            logger.info("检查edge-tts服务连接...")
             asyncio.run(self.convert_all_sentences_parallel())
+            logger.info(f"异步转换完成，耗时: {(time.time() - async_start):.2f}s")
             
         except Exception as e:
+            logger.error(f"转换过程出错: {str(e)}", exc_info=True)
             self.root.after(0, lambda: messagebox.showerror("错误", f"转换失败: {str(e)}"))
         finally:
             self.is_converting = False
             self.root.after(0, self.update_button_states)
+            logger.info(f"=== 转换流程结束，总耗时: {(time.time() - process_start):.2f}s ===")
     
-    async def convert_single_sentence(self, sentence, index):
-        """转换单个句子"""
+    async def get_session(self):
+        """获取或创建aiohttp会话"""
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            connector = aiohttp.TCPConnector(
+                limit=20,  # 连接池大小
+                limit_per_host=10,
+                ttl_dns_cache=300,
+                use_dns_cache=True,
+            )
+            self.session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector
+            )
+        return self.session
+    
+    async def convert_single_sentence_optimized(self, sentence, index):
+        """优化的单句转换"""
+        start_time = time.time()
+        logger.info(f"开始转换句子 {index+1}: {sentence[:50]}...")
+        
+        # 创建临时文件
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
         temp_file.close()
         
-        # 直接使用纯文本，不使用SSML
-        communicate = edge_tts.Communicate(sentence, self.voice)
-        await communicate.save(temp_file.name)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # 创建Communicate对象
+                communicate_start = time.time()
+                communicate = edge_tts.Communicate(sentence, self.voice)
+                logger.info(f"句子 {index+1} 创建Communicate对象耗时: {(time.time() - communicate_start)*1000:.1f}ms")
+                
+                # 网络请求
+                save_start = time.time()
+                logger.info(f"句子 {index+1} 开始网络请求... (尝试 {attempt+1}/{max_retries})")
+                
+                await communicate.save(temp_file.name)
+                
+                save_time = time.time() - save_start
+                logger.info(f"句子 {index+1} 网络请求+保存完成，耗时: {save_time*1000:.1f}ms")
+                
+                # 检查文件
+                file_size = os.path.getsize(temp_file.name) if os.path.exists(temp_file.name) else 0
+                logger.info(f"句子 {index+1} 生成文件大小: {file_size} bytes")
+                
+                if file_size > 0:
+                    break  # 成功
+                else:
+                    logger.warning(f"句子 {index+1} 生成文件为空，重试...")
+                    
+            except Exception as e:
+                logger.error(f"句子 {index+1} 尝试 {attempt+1} 失败: {str(e)}")
+                if attempt == max_retries - 1:
+                    raise e
+                await asyncio.sleep(1)  # 重试前等待
+        
+        total_time = time.time() - start_time
+        logger.info(f"句子 {index+1} 转换完成，总耗时: {total_time*1000:.1f}ms")
         
         return index, temp_file.name
     
     async def convert_all_sentences_parallel(self):
-        """并行转换所有句子为音频文件"""
+        """优化的并行转换"""
+        total_start = time.time()
         total_sentences = len(self.sentences)
+        logger.info(f"开始并行转换 {total_sentences} 个句子")
+        
         self.audio_files = [None] * total_sentences
         self.temp_files = []
         
-        max_workers = int(self.thread_var.get())
+        # 降低并发数，提高成功率
+        max_workers = min(4, int(self.thread_var.get()))  # 最多4个并发
+        logger.info(f"使用 {max_workers} 个并发线程（优化后）")
         
+        # 创建任务
         tasks = []
         for i, sentence in enumerate(self.sentences):
-            task = self.convert_single_sentence(sentence, i)
+            task = self.convert_single_sentence_optimized(sentence, i)
             tasks.append(task)
         
+        # 使用信号量控制并发
         semaphore = asyncio.Semaphore(max_workers)
         
         async def limited_convert(task):
             async with semaphore:
                 return await task
         
+        # 批量执行，添加延迟
         completed = 0
-        for coro in asyncio.as_completed([limited_convert(task) for task in tasks]):
-            if not self.is_converting:
-                break
+        batch_size = 2  # 每批2个任务
+        
+        for i in range(0, len(tasks), batch_size):
+            batch = tasks[i:i+batch_size]
+            logger.info(f"开始执行批次 {i//batch_size + 1}，包含 {len(batch)} 个任务")
+            
+            # 执行当前批次
+            batch_results = await asyncio.gather(
+                *[limited_convert(task) for task in batch],
+                return_exceptions=True
+            )
+            
+            # 处理结果
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    logger.error(f"批次任务失败: {result}")
+                    continue
+                    
+                index, temp_file_path = result
+                self.audio_files[index] = temp_file_path
+                self.temp_files.append(temp_file_path)
+                completed += 1
                 
-            index, temp_file_path = await coro
-            self.audio_files[index] = temp_file_path
-            self.temp_files.append(temp_file_path)
+                logger.info(f"句子 {index+1} 任务完成，进度: {completed}/{total_sentences}")
+                
+                # 更新UI
+                self.root.after(0, lambda c=completed: self.status_label.config(text=f"状态: 转换中... ({c}/{total_sentences})"))
+                self.root.after(0, lambda c=completed: self.progress_var.set((c/total_sentences)*100))
             
-            completed += 1
-            
-            # 更新UI，但不标记句子颜色
-            self.root.after(0, lambda c=completed: self.status_label.config(text=f"状态: 转换中... ({c}/{total_sentences})"))
-            self.root.after(0, lambda c=completed: self.progress_var.set((c/total_sentences)*100))
-            self.root.after(0, lambda c=completed: self.progress_label.config(text=f"转换: {c}/{total_sentences}"))
+            # 批次间延迟，避免请求过于密集
+            if i + batch_size < len(tasks):
+                await asyncio.sleep(0.5)
+        
+        # 清理会话
+        if self.session and not self.session.closed:
+            await self.session.close()
+            self.session = None
+        
+        convert_time = time.time() - total_start
+        logger.info(f"所有句子转换完成，耗时: {convert_time:.2f}s，平均每句: {(convert_time/total_sentences)*1000:.1f}ms")
         
         # 转换完成
         if self.is_converting:
             self.is_converted = True
-            self.root.after(0, lambda: self.status_label.config(text=f"状态: 转换完成，使用{max_workers}个线程"))
+            self.root.after(0, lambda: self.status_label.config(text=f"状态: 转换完成"))
             self.root.after(0, lambda: self.progress_var.set(100))
-            # 移除make_sentences_clickable调用，避免蓝色下划线
             
-            # 保存到历史记录
-            text = self.text_widget.get(1.0, tk.END).strip()
-            self.config.add_history(text, self.voice, len(self.sentences))
-            self.config.update_settings(self.voice, self.max_workers)
+            total_time = time.time() - total_start
+            logger.info(f"=== 并行转换完成，总耗时: {total_time:.2f}s ===")
     
     def save_audio(self):
         """保存音频文件"""
@@ -817,4 +948,10 @@ if __name__ == "__main__":
     app = TTSReader(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
+
+
+
+
+
+
 
