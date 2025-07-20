@@ -1,20 +1,26 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import pygame
+import edge_tts
 import asyncio
 import threading
-import re
-import edge_tts
-import pygame
 import tempfile
 import os
 import shutil
+import re
 from datetime import datetime
-import concurrent.futures
-import multiprocessing
+from config import Config
 
 class TTSReader:
     def __init__(self, root):
         self.root = root
+        self.config = Config()
+        
+        # 从配置文件加载设置
+        last_settings = self.config.get_last_settings()
+        self.voice = last_settings["voice"]
+        self.max_workers = last_settings["max_workers"]
+        
         self.root.title("TTS文本朗读器")
         self.root.geometry("800x600")
         
@@ -30,10 +36,6 @@ class TTSReader:
         self.is_converted = False  # 是否已转换
         self.is_converting = False  # 是否正在转换
         self.temp_files = []
-        self.voice = "zh-CN-XiaoxiaoNeural"
-        
-        # 自适应线程数：CPU核心数的2倍，但不超过8个
-        self.max_workers = min(8, max(2, multiprocessing.cpu_count() * 2))
         
         self.setup_ui()
         
@@ -108,6 +110,13 @@ class TTSReader:
         self.thread_var = tk.StringVar(value=str(self.max_workers))
         thread_spinbox = tk.Spinbox(control_frame, from_=1, to=16, width=3, textvariable=self.thread_var)
         thread_spinbox.pack(side=tk.LEFT, padx=(5,0))
+        
+        # 历史记录按钮
+        history_btn = ttk.Button(control_frame, text="历史记录", command=self.show_history)
+        history_btn.pack(side=tk.LEFT, padx=(10,5))
+        
+        clear_history_btn = ttk.Button(control_frame, text="清空历史", command=self.clear_history)
+        clear_history_btn.pack(side=tk.LEFT, padx=(5,0))
         
         # 第一行按钮
         button_frame1 = ttk.Frame(main_frame)
@@ -361,7 +370,12 @@ class TTSReader:
             self.is_converted = True
             self.root.after(0, lambda: self.status_label.config(text=f"状态: 转换完成，使用{max_workers}个线程"))
             self.root.after(0, lambda: self.progress_var.set(100))
-            self.root.after(0, self.make_sentences_clickable)
+            # 移除make_sentences_clickable调用，避免蓝色下划线
+            
+            # 保存到历史记录
+            text = self.text_widget.get(1.0, tk.END).strip()
+            self.config.add_history(text, self.voice, len(self.sentences))
+            self.config.update_settings(self.voice, self.max_workers)
     
     def save_audio(self):
         """保存音频文件"""
@@ -658,21 +672,47 @@ class TTSReader:
         pygame.mixer.quit()
         self.root.destroy()
 
+    def show_history(self):
+        """显示历史记录"""
+        history_window = tk.Toplevel(self.root)
+        history_window.title("转换历史")
+        history_window.geometry("600x400")
+        
+        # 创建列表框
+        listbox = tk.Listbox(history_window)
+        scrollbar = ttk.Scrollbar(history_window, orient=tk.VERTICAL, command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+        
+        # 添加历史记录
+        for item in self.config.config["history"]:
+            display_text = f"{item['timestamp']} | {item['voice']} | {item['sentences_count']}句 | {item['text']}"
+            listbox.insert(tk.END, display_text)
+        
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # 双击加载历史文本
+        def on_double_click(event):
+            selection = listbox.curselection()
+            if selection:
+                index = selection[0]
+                history_item = self.config.config["history"][index]
+                # 这里只能显示截断的文本，实际应用中可能需要存储完整文本
+                messagebox.showinfo("历史文本", f"文本预览:\n{history_item['text']}")
+        
+        listbox.bind("<Double-Button-1>", on_double_click)
+
+    def clear_history(self):
+        """清空历史记录"""
+        if messagebox.askyesno("确认", "确定要清空所有历史记录吗？"):
+            self.config.clear_history()
+            messagebox.showinfo("成功", "历史记录已清空")
+
 if __name__ == "__main__":
     root = tk.Tk()
     app = TTSReader(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
-
-
-
-
-
-
-
-
-
-
 
 
 
