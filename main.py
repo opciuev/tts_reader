@@ -324,26 +324,22 @@ class TTSReader:
     async def convert_all_sentences_parallel(self):
         """并行转换所有句子为音频文件"""
         total_sentences = len(self.sentences)
-        self.audio_files = [None] * total_sentences  # 预分配数组
+        self.audio_files = [None] * total_sentences
         self.temp_files = []
         
-        # 获取线程数
         max_workers = int(self.thread_var.get())
         
-        # 创建任务列表
         tasks = []
         for i, sentence in enumerate(self.sentences):
             task = self.convert_single_sentence(sentence, i)
             tasks.append(task)
         
-        # 使用信号量限制并发数
         semaphore = asyncio.Semaphore(max_workers)
         
         async def limited_convert(task):
             async with semaphore:
                 return await task
         
-        # 并行执行转换
         completed = 0
         for coro in asyncio.as_completed([limited_convert(task) for task in tasks]):
             if not self.is_converting:
@@ -355,11 +351,10 @@ class TTSReader:
             
             completed += 1
             
-            # 更新UI
+            # 更新UI，但不标记句子颜色
             self.root.after(0, lambda c=completed: self.status_label.config(text=f"状态: 转换中... ({c}/{total_sentences})"))
             self.root.after(0, lambda c=completed: self.progress_var.set((c/total_sentences)*100))
             self.root.after(0, lambda c=completed: self.progress_label.config(text=f"转换: {c}/{total_sentences}"))
-            self.root.after(0, lambda i=index: self.mark_sentence_converted(i))
         
         # 转换完成
         if self.is_converting:
@@ -458,7 +453,7 @@ class TTSReader:
             char_count += len(sentence)
             if char_count >= len(clicked_text):
                 self.current_sentence = i
-                self.play_from_sentence(i)
+                self.play_single_sentence(i)  # 只播放单句
                 break
     
     def on_text_hover(self, event):
@@ -467,6 +462,40 @@ class TTSReader:
             self.text_widget.config(cursor="hand2")
         else:
             self.text_widget.config(cursor="xterm")
+    
+    def play_single_sentence(self, sentence_index):
+        """播放单个句子"""
+        if not self.is_converted or sentence_index >= len(self.audio_files):
+            return
+            
+        self.stop_play()  # 停止当前播放
+        self.current_sentence = sentence_index
+        self.is_playing = True
+        
+        # 高亮当前句子
+        self.highlight_current_sentence()
+        
+        # 播放音频
+        pygame.mixer.music.load(self.audio_files[self.current_sentence])
+        pygame.mixer.music.play()
+        
+        self.update_button_states()
+        self.status_label.config(text=f"状态: 播放第{self.current_sentence+1}句")
+        
+        # 监控播放完成但不自动播放下一句
+        self.monitor_single_play()
+    
+    def monitor_single_play(self):
+        """监控单句播放完成"""
+        if pygame.mixer.music.get_busy() and self.is_playing:
+            # 还在播放，继续监控
+            self.root.after(100, self.monitor_single_play)
+        elif self.is_playing:
+            # 播放完成，停止播放
+            self.is_playing = False
+            self.update_button_states()
+            self.text_widget.tag_remove("current", 1.0, tk.END)
+            self.status_label.config(text="状态: 播放完成")
     
     def play_from_sentence(self, sentence_index):
         """从指定句子开始连续播放"""
@@ -634,6 +663,9 @@ if __name__ == "__main__":
     app = TTSReader(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
+
+
+
 
 
 
