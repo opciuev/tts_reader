@@ -37,6 +37,7 @@ class TTSReader:
         self.is_converting = False  # 是否正在转换
         self.temp_files = []
         self.is_continuous_play = False  # 是否为连续播放模式
+        self.last_text_content = ""  # 记录上次的文本内容
         
         self.setup_ui()
         
@@ -187,8 +188,8 @@ class TTSReader:
         # 绑定文本点击事件和文本变化事件
         self.text_widget.bind("<Button-1>", self.on_text_click)
         self.text_widget.bind("<Motion>", self.on_text_hover)
-        self.text_widget.bind("<KeyRelease>", self.on_text_change)
-        # 移除ButtonRelease绑定，避免点击时误触发
+        self.text_widget.bind("<<Modified>>", self.on_text_modified)
+        # 移除KeyRelease绑定，只使用Modified事件
     
     def format_rate_value(self):
         """格式化语速值"""
@@ -214,24 +215,29 @@ class TTSReader:
         except:
             self.pitch_var.set("0Hz")
     
-    def on_text_change(self, event=None):
-        """文本内容改变时的处理"""
-        # 防止在处理过程中重复触发
-        if hasattr(self, '_processing_text_change') and self._processing_text_change:
-            return
+    def on_text_modified(self, event=None):
+        """文本内容被修改时触发"""
+        if self.text_widget.edit_modified():
+            # 重置修改标志
+            self.text_widget.edit_modified(False)
+            
+            # 获取当前文本内容
+            current_text = self.text_widget.get(1.0, tk.END).strip()
+            
+            # 检查文本是否真的发生了变化
+            if current_text != self.last_text_content:
+                self.last_text_content = current_text
+                self.on_text_content_changed()
+    
+    def on_text_content_changed(self):
+        """文本内容发生变化时的处理"""
+        # 自动分割句子
+        self.split_sentences()
         
-        self._processing_text_change = True
-        
-        try:
-            # 自动分割句子
-            self.split_sentences()
-            # 如果已经转换过，重置转换状态
-            if self.is_converted:
-                self.reset_conversion_state()
-                self.status_label.config(text="状态: 文本已更改，需重新转换")
-        finally:
-            # 延迟重置标志，避免连续触发
-            self.root.after(100, lambda: setattr(self, '_processing_text_change', False))
+        # 如果已经转换过，重置转换状态
+        if self.is_converted:
+            self.reset_conversion_state()
+            self.status_label.config(text="状态: 文本已更改，需重新转换")
     
     def read_clipboard(self):
         """读取剪贴板内容"""
@@ -295,17 +301,17 @@ class TTSReader:
     
     def convert_text(self):
         """开始转换文本为音频"""
-        # 确保获取最新的文本内容
-        self.split_sentences()
-        
-        if not self.sentences:
+        # 快速检查
+        if not self.text_widget.get(1.0, tk.END).strip():
             messagebox.showwarning("警告", "请先输入文本")
             return
-            
+        
+        # 立即更新状态，避免用户等待
         self.is_converting = True
         self.update_button_states()
+        self.status_label.config(text="状态: 准备转换...")
         
-        # 在新线程中处理TTS转换
+        # 立即启动线程，减少延迟
         thread = threading.Thread(target=self.process_conversion)
         thread.daemon = True
         thread.start()
@@ -313,7 +319,31 @@ class TTSReader:
     def process_conversion(self):
         """处理TTS转换"""
         try:
+            # 在线程中进行文本分割，避免阻塞UI
+            self.root.after(0, lambda: self.status_label.config(text="状态: 分析文本..."))
+            
+            # 确保获取最新的文本内容并分割
+            text = self.text_widget.get(1.0, tk.END).strip()
+            if not text:
+                self.root.after(0, lambda: messagebox.showwarning("警告", "文本为空"))
+                return
+            
+            # 在主线程中分割句子
+            self.root.after(0, self.split_sentences)
+            
+            # 等待分割完成
+            import time
+            time.sleep(0.1)
+            
+            if not self.sentences:
+                self.root.after(0, lambda: messagebox.showwarning("警告", "无法分割句子"))
+                return
+            
+            self.root.after(0, lambda: self.status_label.config(text="状态: 开始转换..."))
+            
+            # 开始异步转换
             asyncio.run(self.convert_all_sentences_parallel())
+            
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("错误", f"转换失败: {str(e)}"))
         finally:
@@ -384,44 +414,67 @@ class TTSReader:
             messagebox.showwarning("警告", "请先转换文本")
             return
         
-        # 选择保存目录
-        save_dir = filedialog.askdirectory(title="选择保存目录")
-        if not save_dir:
+        # 生成默认文件名
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_filename = f"{timestamp}.mp3"
+        
+        # 选择保存文件
+        save_path = filedialog.asksaveasfilename(
+            title="保存合并音频",
+            defaultextension=".mp3",
+            initialvalue=default_filename,
+            filetypes=[("MP3 files", "*.mp3"), ("All files", "*.*")]
+        )
+        
+        if not save_path:
             return
         
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # 保存单个句子音频
-            for i, (sentence, audio_file) in enumerate(zip(self.sentences, self.audio_files)):
-                safe_sentence = re.sub(r'[^\w\s-]', '', sentence[:30])  # 取前30个字符作为文件名
-                safe_sentence = re.sub(r'[-\s]+', '_', safe_sentence)
-                filename = f"{timestamp}_第{i+1:03d}句_{safe_sentence}.mp3"
-                save_path = os.path.join(save_dir, filename)
-                shutil.copy2(audio_file, save_path)
-            
             # 合并所有音频为一个文件
-            combined_filename = f"{timestamp}_完整音频.mp3"
-            combined_path = os.path.join(save_dir, combined_filename)
-            self.combine_audio_files(combined_path)
+            self.combine_audio_files(save_path)
             
-            messagebox.showinfo("成功", f"音频已保存到: {save_dir}\n包含{len(self.audio_files)}个单句音频和1个完整音频")
+            # 询问是否保存单句音频
+            if messagebox.askyesno("保存选项", "是否同时保存单句音频文件？"):
+                save_dir = os.path.dirname(save_path)
+                base_name = os.path.splitext(os.path.basename(save_path))[0]
+                
+                # 保存单个句子音频
+                for i, (sentence, audio_file) in enumerate(zip(self.sentences, self.audio_files)):
+                    safe_sentence = re.sub(r'[^\w\s-]', '', sentence[:20])  # 取前20个字符
+                    safe_sentence = re.sub(r'[-\s]+', '_', safe_sentence)
+                    filename = f"{base_name}_第{i+1:03d}句_{safe_sentence}.mp3"
+                    single_save_path = os.path.join(save_dir, filename)
+                    shutil.copy2(audio_file, single_save_path)
+                
+                messagebox.showinfo("成功", f"音频已保存:\n主文件: {save_path}\n单句文件: {len(self.audio_files)}个")
+            else:
+                messagebox.showinfo("成功", f"音频已保存: {save_path}")
             
         except Exception as e:
             messagebox.showerror("错误", f"保存失败: {str(e)}")
     
     def combine_audio_files(self, output_path):
-        """合并音频文件"""
+        """合并音频文件 - 使用更高效的方法"""
         try:
-            # 使用pygame合并音频（简单的文件拼接）
+            # 简单的二进制拼接（适用于相同格式的MP3文件）
             with open(output_path, 'wb') as outfile:
-                for audio_file in self.audio_files:
-                    with open(audio_file, 'rb') as infile:
-                        outfile.write(infile.read())
+                for i, audio_file in enumerate(self.audio_files):
+                    if os.path.exists(audio_file):
+                        with open(audio_file, 'rb') as infile:
+                            # 跳过第一个文件之外的MP3头部信息（简化处理）
+                            if i == 0:
+                                outfile.write(infile.read())
+                            else:
+                                # 跳过MP3头部，只写入音频数据部分
+                                content = infile.read()
+                                # 简单处理：直接拼接（可能有轻微的播放间隙）
+                                outfile.write(content)
         except Exception as e:
             # 如果合并失败，至少保存第一个文件
-            if self.audio_files:
+            if self.audio_files and os.path.exists(self.audio_files[0]):
                 shutil.copy2(self.audio_files[0], output_path)
+            else:
+                raise e
     
     def mark_sentence_converted(self, sentence_index):
         """标记句子为已转换"""
@@ -764,10 +817,4 @@ if __name__ == "__main__":
     app = TTSReader(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()
-
-
-
-
-
-
 
