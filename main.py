@@ -1,0 +1,585 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import asyncio
+import threading
+import re
+import edge_tts
+import pygame
+import tempfile
+import os
+import shutil
+from datetime import datetime
+
+class TTSReader:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("TTS文本朗读器")
+        self.root.geometry("800x600")
+        
+        # 初始化pygame音频
+        pygame.mixer.init()
+        
+        # 状态变量
+        self.sentences = []
+        self.audio_files = []  # 存储每句对应的音频文件
+        self.current_sentence = 0
+        self.is_playing = False
+        self.is_paused = False
+        self.is_converted = False  # 是否已转换
+        self.is_converting = False  # 是否正在转换
+        self.temp_files = []
+        self.voice = "zh-CN-XiaoxiaoNeural"
+        
+        self.setup_ui()
+        
+    def setup_ui(self):
+        # 主框架
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 控制区域
+        control_frame = ttk.Frame(main_frame)
+        control_frame.pack(fill=tk.X, pady=(0,10))
+        
+        # 语音选择
+        ttk.Label(control_frame, text="语音:").pack(side=tk.LEFT)
+        self.voice_var = tk.StringVar(value=self.voice)
+        voice_combo = ttk.Combobox(control_frame, textvariable=self.voice_var, width=30)
+        voice_combo['values'] = [
+            # 中文语音
+            "zh-CN-XiaoxiaoNeural",
+            "zh-CN-YunyeNeural", 
+            "zh-CN-YunjianNeural",
+            "zh-CN-XiaoyiNeural",
+            "zh-CN-YunxiNeural",
+            "zh-CN-XiaochenNeural",
+            "zh-CN-XiaohanNeural",
+            "zh-CN-XiaomengNeural",
+            "zh-CN-XiaomoNeural",
+            "zh-CN-XiaoqiuNeural",
+            "zh-CN-XiaoruiNeural",
+            "zh-CN-XiaoshuangNeural",
+            "zh-CN-XiaoxuanNeural",
+            "zh-CN-XiaoyanNeural",
+            "zh-CN-XiaoyouNeural",
+            "zh-CN-XiaozhenNeural",
+            # 日文语音
+            "ja-JP-NanamiNeural",
+            "ja-JP-KeitaNeural",
+            "ja-JP-AoiNeural",
+            "ja-JP-DaichiNeural",
+            "ja-JP-MayuNeural",
+            "ja-JP-NaokiNeural",
+            "ja-JP-ShioriNeural",
+            # 英文语音
+            "en-US-AriaNeural",
+            "en-US-JennyNeural",
+            "en-US-GuyNeural",
+            "en-US-DavisNeural",
+            "en-US-AmberNeural",
+            "en-US-AnaNeural",
+            "en-US-AndrewNeural",
+            "en-US-EmmaNeural",
+            "en-US-BrianNeural",
+            "en-US-ChristopherNeural",
+            "en-US-ElizabethNeural",
+            "en-US-EricNeural",
+            "en-US-JacobNeural",
+            "en-US-JaneNeural",
+            "en-US-JasonNeural",
+            "en-US-MichelleNeural",
+            "en-US-MonicaNeural",
+            "en-US-NancyNeural",
+            "en-US-RogerNeural",
+            "en-US-SaraNeural",
+            "en-US-SteffanNeural",
+            "en-US-TonyNeural"
+        ]
+        voice_combo.pack(side=tk.LEFT, padx=(5,10))
+        voice_combo.bind('<<ComboboxSelected>>', self.on_voice_change)
+        
+        # 第一行按钮
+        button_frame1 = ttk.Frame(main_frame)
+        button_frame1.pack(fill=tk.X, pady=(0,5))
+        
+        # 剪贴板按钮
+        ttk.Button(button_frame1, text="读取剪贴板", command=self.read_clipboard).pack(side=tk.LEFT, padx=(0,5))
+        
+        # 转换按钮
+        self.convert_btn = ttk.Button(button_frame1, text="开始转换", command=self.convert_text)
+        self.convert_btn.pack(side=tk.LEFT, padx=(0,5))
+        
+        # 保存音频按钮
+        self.save_btn = ttk.Button(button_frame1, text="保存音频", command=self.save_audio, state="disabled")
+        self.save_btn.pack(side=tk.LEFT, padx=(0,5))
+        
+        # 第二行按钮 - 播放控制
+        button_frame2 = ttk.Frame(main_frame)
+        button_frame2.pack(fill=tk.X, pady=(0,10))
+        
+        # 播放控制按钮
+        self.play_btn = ttk.Button(button_frame2, text="播放当前", command=self.play_current, state="disabled")
+        self.play_btn.pack(side=tk.LEFT, padx=(0,5))
+        
+        self.pause_btn = ttk.Button(button_frame2, text="暂停", command=self.pause_play, state="disabled")
+        self.pause_btn.pack(side=tk.LEFT, padx=(0,5))
+        
+        self.stop_btn = ttk.Button(button_frame2, text="停止", command=self.stop_play, state="disabled")
+        self.stop_btn.pack(side=tk.LEFT, padx=(0,5))
+        
+        self.play_all_btn = ttk.Button(button_frame2, text="连续播放", command=self.play_all, state="disabled")
+        self.play_all_btn.pack(side=tk.LEFT)
+        
+        # 状态显示
+        status_frame = ttk.Frame(main_frame)
+        status_frame.pack(fill=tk.X, pady=(0,10))
+        
+        self.status_label = ttk.Label(status_frame, text="状态: 就绪")
+        self.status_label.pack(side=tk.LEFT)
+        
+        self.progress_label = ttk.Label(status_frame, text="进度: 0/0")
+        self.progress_label.pack(side=tk.RIGHT)
+        
+        # 进度条
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=(0,10))
+        
+        # 文本区域
+        text_frame = ttk.LabelFrame(main_frame, text="文本内容", padding="5")
+        text_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 创建文本框和滚动条
+        text_container = ttk.Frame(text_frame)
+        text_container.pack(fill=tk.BOTH, expand=True)
+        
+        self.text_widget = tk.Text(text_container, wrap=tk.WORD, font=("微软雅黑", 12))
+        scrollbar = ttk.Scrollbar(text_container, orient=tk.VERTICAL, command=self.text_widget.yview)
+        self.text_widget.configure(yscrollcommand=scrollbar.set)
+        
+        self.text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # 配置文本高亮标签
+        self.text_widget.tag_configure("current", background="yellow", foreground="black")
+        self.text_widget.tag_configure("completed", background="lightgreen", foreground="black")
+        self.text_widget.tag_configure("converted", background="lightblue", foreground="black")
+        self.text_widget.tag_configure("clickable", foreground="blue", underline=True)
+        
+        # 绑定文本点击事件和文本变化事件
+        self.text_widget.bind("<Button-1>", self.on_text_click)
+        self.text_widget.bind("<Motion>", self.on_text_hover)
+        self.text_widget.bind("<KeyRelease>", self.on_text_change)
+        self.text_widget.bind("<ButtonRelease>", self.on_text_change)
+        
+    def on_text_change(self, event=None):
+        """文本内容改变时的处理"""
+        # 自动分割句子
+        self.split_sentences()
+        # 如果已经转换过，重置转换状态
+        if self.is_converted:
+            self.reset_conversion_state()
+            self.status_label.config(text="状态: 文本已更改，需重新转换")
+        
+    def read_clipboard(self):
+        """读取剪贴板内容"""
+        try:
+            clipboard_text = self.root.clipboard_get()
+            self.text_widget.delete(1.0, tk.END)
+            self.text_widget.insert(1.0, clipboard_text)
+            self.split_sentences()
+            self.reset_conversion_state()
+            self.status_label.config(text="状态: 已读取剪贴板")
+        except tk.TclError:
+            messagebox.showwarning("警告", "剪贴板为空或无法读取")
+    
+    def split_sentences(self):
+        """将文本分割为句子"""
+        text = self.text_widget.get(1.0, tk.END).strip()
+        if not text:
+            self.sentences = []
+            self.progress_label.config(text="句子: 0句")
+            return
+            
+        # 按句号、问号、感叹号、换行分割
+        sentences = re.split(r'[。！？\n]+', text)
+        self.sentences = [s.strip() for s in sentences if s.strip()]
+        self.current_sentence = 0
+        
+        # 清除所有标签
+        self.text_widget.tag_remove("current", 1.0, tk.END)
+        self.text_widget.tag_remove("completed", 1.0, tk.END)
+        self.text_widget.tag_remove("converted", 1.0, tk.END)
+        self.text_widget.tag_remove("clickable", 1.0, tk.END)
+        
+        self.progress_label.config(text=f"句子: {len(self.sentences)}句")
+    
+    def reset_conversion_state(self):
+        """重置转换状态"""
+        self.is_converted = False
+        self.audio_files = []
+        self.cleanup_temp_files()
+        self.update_button_states()
+    
+    def on_voice_change(self, event):
+        """语音选择改变"""
+        self.voice = self.voice_var.get()
+        self.status_label.config(text=f"状态: 已切换语音 - {self.voice}")
+        if self.is_converted:
+            self.reset_conversion_state()
+            self.status_label.config(text="状态: 语音已更改，需重新转换")
+    
+    def convert_text(self):
+        """开始转换文本为音频"""
+        # 确保获取最新的文本内容
+        self.split_sentences()
+        
+        if not self.sentences:
+            messagebox.showwarning("警告", "请先输入文本")
+            return
+            
+        self.is_converting = True
+        self.update_button_states()
+        
+        # 在新线程中处理TTS转换
+        thread = threading.Thread(target=self.process_conversion)
+        thread.daemon = True
+        thread.start()
+    
+    def process_conversion(self):
+        """处理TTS转换"""
+        try:
+            asyncio.run(self.convert_all_sentences())
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("错误", f"转换失败: {str(e)}"))
+        finally:
+            self.is_converting = False
+            self.root.after(0, self.update_button_states)
+    
+    async def convert_all_sentences(self):
+        """转换所有句子为音频文件"""
+        total_sentences = len(self.sentences)
+        self.audio_files = []
+        
+        for i, sentence in enumerate(self.sentences):
+            if not self.is_converting:
+                break
+                
+            # 更新UI
+            self.root.after(0, lambda i=i: self.status_label.config(text=f"状态: 转换中... ({i+1}/{total_sentences})"))
+            self.root.after(0, lambda i=i: self.progress_var.set((i/total_sentences)*100))
+            self.root.after(0, lambda i=i: self.progress_label.config(text=f"转换: {i+1}/{total_sentences}"))
+            
+            # 生成临时音频文件
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+            temp_file.close()
+            self.temp_files.append(temp_file.name)
+            
+            # TTS转换
+            communicate = edge_tts.Communicate(sentence, self.voice)
+            await communicate.save(temp_file.name)
+            
+            self.audio_files.append(temp_file.name)
+            
+            # 标记句子为已转换
+            self.root.after(0, lambda i=i: self.mark_sentence_converted(i))
+        
+        # 转换完成
+        if self.is_converting:
+            self.is_converted = True
+            self.root.after(0, lambda: self.status_label.config(text="状态: 转换完成，可以播放"))
+            self.root.after(0, lambda: self.progress_var.set(100))
+            self.root.after(0, self.make_sentences_clickable)
+    
+    def save_audio(self):
+        """保存音频文件"""
+        if not self.is_converted or not self.audio_files:
+            messagebox.showwarning("警告", "请先转换文本")
+            return
+        
+        # 选择保存目录
+        save_dir = filedialog.askdirectory(title="选择保存目录")
+        if not save_dir:
+            return
+        
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # 保存单个句子音频
+            for i, (sentence, audio_file) in enumerate(zip(self.sentences, self.audio_files)):
+                safe_sentence = re.sub(r'[^\w\s-]', '', sentence[:30])  # 取前30个字符作为文件名
+                safe_sentence = re.sub(r'[-\s]+', '_', safe_sentence)
+                filename = f"{timestamp}_第{i+1:03d}句_{safe_sentence}.mp3"
+                save_path = os.path.join(save_dir, filename)
+                shutil.copy2(audio_file, save_path)
+            
+            # 合并所有音频为一个文件
+            combined_filename = f"{timestamp}_完整音频.mp3"
+            combined_path = os.path.join(save_dir, combined_filename)
+            self.combine_audio_files(combined_path)
+            
+            messagebox.showinfo("成功", f"音频已保存到: {save_dir}\n包含{len(self.audio_files)}个单句音频和1个完整音频")
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败: {str(e)}")
+    
+    def combine_audio_files(self, output_path):
+        """合并音频文件"""
+        try:
+            # 使用pygame合并音频（简单的文件拼接）
+            with open(output_path, 'wb') as outfile:
+                for audio_file in self.audio_files:
+                    with open(audio_file, 'rb') as infile:
+                        outfile.write(infile.read())
+        except Exception as e:
+            # 如果合并失败，至少保存第一个文件
+            if self.audio_files:
+                shutil.copy2(self.audio_files[0], output_path)
+    
+    def mark_sentence_converted(self, sentence_index):
+        """标记句子为已转换"""
+        if sentence_index < len(self.sentences):
+            text = self.text_widget.get(1.0, tk.END)
+            start_pos = 0
+            
+            for i in range(sentence_index):
+                start_pos = text.find(self.sentences[i], start_pos) + len(self.sentences[i])
+            
+            sentence_start = text.find(self.sentences[sentence_index], start_pos)
+            if sentence_start != -1:
+                sentence_end = sentence_start + len(self.sentences[sentence_index])
+                start_index = f"1.0+{sentence_start}c"
+                end_index = f"1.0+{sentence_end}c"
+                self.text_widget.tag_add("converted", start_index, end_index)
+    
+    def make_sentences_clickable(self):
+        """使所有句子可点击"""
+        text = self.text_widget.get(1.0, tk.END)
+        start_pos = 0
+        
+        for i, sentence in enumerate(self.sentences):
+            sentence_start = text.find(sentence, start_pos)
+            if sentence_start != -1:
+                sentence_end = sentence_start + len(sentence)
+                start_index = f"1.0+{sentence_start}c"
+                end_index = f"1.0+{sentence_end}c"
+                self.text_widget.tag_add("clickable", start_index, end_index)
+                start_pos = sentence_end
+    
+    def on_text_click(self, event):
+        """点击文本播放对应句子"""
+        if not self.is_converted or not self.sentences:
+            return
+            
+        # 获取点击位置
+        index = self.text_widget.index(tk.CURRENT)
+        clicked_text = self.text_widget.get(1.0, index)
+        
+        # 计算点击位置对应的句子
+        char_count = 0
+        for i, sentence in enumerate(self.sentences):
+            char_count += len(sentence)
+            if char_count >= len(clicked_text):
+                self.current_sentence = i
+                self.play_sentence(i)
+                break
+    
+    def on_text_hover(self, event):
+        """鼠标悬停时改变光标"""
+        if self.is_converted:
+            self.text_widget.config(cursor="hand2")
+        else:
+            self.text_widget.config(cursor="xterm")
+    
+    def play_sentence(self, sentence_index):
+        """播放指定句子"""
+        if not self.is_converted or sentence_index >= len(self.audio_files):
+            return
+            
+        self.stop_play()  # 停止当前播放
+        self.current_sentence = sentence_index
+        
+        # 高亮当前句子
+        self.highlight_current_sentence()
+        
+        # 播放音频
+        pygame.mixer.music.load(self.audio_files[sentence_index])
+        pygame.mixer.music.play()
+        
+        self.is_playing = True
+        self.update_button_states()
+        self.status_label.config(text=f"状态: 播放第{sentence_index+1}句")
+        
+        # 监控播放完成
+        self.monitor_playback()
+    
+    def play_current(self):
+        """播放当前句子"""
+        if not self.is_converted:
+            return
+            
+        if self.is_paused:
+            pygame.mixer.music.unpause()
+            self.is_paused = False
+            self.status_label.config(text="状态: 继续播放")
+        else:
+            self.play_sentence(self.current_sentence)
+        self.update_button_states()
+    
+    def play_all(self):
+        """连续播放所有句子"""
+        if not self.is_converted:
+            return
+        self.current_sentence = 0
+        self.is_playing = True
+        self.play_continuous()
+    
+    def play_continuous(self):
+        """连续播放模式"""
+        if self.current_sentence < len(self.sentences) and self.is_playing:
+            self.play_sentence(self.current_sentence)
+            # 设置定时器检查播放完成后播放下一句
+            self.root.after(100, self.check_and_play_next)
+    
+    def check_and_play_next(self):
+        """检查并播放下一句"""
+        if not pygame.mixer.music.get_busy() and self.is_playing:
+            self.mark_sentence_completed()
+            self.current_sentence += 1
+            if self.current_sentence < len(self.sentences):
+                # 继续播放下一句
+                self.root.after(500, self.play_continuous)  # 稍微延迟避免音频切换问题
+            else:
+                self.is_playing = False
+                self.update_button_states()
+                self.status_label.config(text="状态: 连续播放完成")
+        elif self.is_playing:
+            self.root.after(100, self.check_and_play_next)
+    
+    def monitor_playback(self):
+        """监控单句播放完成"""
+        if pygame.mixer.music.get_busy() and self.is_playing:
+            self.root.after(100, self.monitor_playback)
+        elif self.is_playing:
+            # 检查是否是连续播放模式
+            if hasattr(self, '_continuous_mode') and self._continuous_mode:
+                return  # 连续播放模式由check_and_play_next处理
+            
+            self.is_playing = False
+            self.update_button_states()
+            self.mark_sentence_completed()
+            self.status_label.config(text="状态: 播放完成")
+    
+    def highlight_current_sentence(self):
+        """高亮当前句子"""
+        if not self.sentences or self.current_sentence >= len(self.sentences):
+            return
+            
+        # 清除当前高亮
+        self.text_widget.tag_remove("current", 1.0, tk.END)
+        
+        # 计算当前句子在文本中的位置
+        text = self.text_widget.get(1.0, tk.END)
+        start_pos = 0
+        
+        for i in range(self.current_sentence):
+            start_pos = text.find(self.sentences[i], start_pos) + len(self.sentences[i])
+        
+        sentence_start = text.find(self.sentences[self.current_sentence], start_pos)
+        if sentence_start != -1:
+            sentence_end = sentence_start + len(self.sentences[self.current_sentence])
+            start_index = f"1.0+{sentence_start}c"
+            end_index = f"1.0+{sentence_end}c"
+            
+            self.text_widget.tag_add("current", start_index, end_index)
+            self.text_widget.see(start_index)
+    
+    def mark_sentence_completed(self):
+        """标记句子为已完成"""
+        if self.current_sentence < len(self.sentences):
+            text = self.text_widget.get(1.0, tk.END)
+            start_pos = 0
+            
+            for i in range(self.current_sentence):
+                start_pos = text.find(self.sentences[i], start_pos) + len(self.sentences[i])
+            
+            sentence_start = text.find(self.sentences[self.current_sentence], start_pos)
+            if sentence_start != -1:
+                sentence_end = sentence_start + len(self.sentences[self.current_sentence])
+                start_index = f"1.0+{sentence_start}c"
+                end_index = f"1.0+{sentence_end}c"
+                self.text_widget.tag_add("completed", start_index, end_index)
+    
+    def pause_play(self):
+        """暂停播放"""
+        pygame.mixer.music.pause()
+        self.is_paused = True
+        self.update_button_states()
+        self.status_label.config(text="状态: 已暂停")
+    
+    def stop_play(self):
+        """停止播放"""
+        self.is_playing = False
+        self.is_paused = False
+        pygame.mixer.music.stop()
+        self.update_button_states()
+        self.text_widget.tag_remove("current", 1.0, tk.END)
+        self.status_label.config(text="状态: 已停止")
+    
+    def update_button_states(self):
+        """更新按钮状态"""
+        if self.is_converting:
+            self.convert_btn.config(state="disabled")
+            self.save_btn.config(state="disabled")
+            self.play_btn.config(state="disabled")
+            self.pause_btn.config(state="disabled")
+            self.stop_btn.config(state="disabled")
+            self.play_all_btn.config(state="disabled")
+        elif self.is_converted:
+            self.convert_btn.config(state="normal")
+            self.save_btn.config(state="normal")
+            if self.is_playing:
+                if self.is_paused:
+                    self.play_btn.config(text="继续", state="normal")
+                    self.pause_btn.config(state="disabled")
+                else:
+                    self.play_btn.config(state="disabled")
+                    self.pause_btn.config(state="normal")
+                self.stop_btn.config(state="normal")
+                self.play_all_btn.config(state="disabled")
+            else:
+                self.play_btn.config(text="播放当前", state="normal")
+                self.pause_btn.config(state="disabled")
+                self.stop_btn.config(state="disabled")
+                self.play_all_btn.config(state="normal")
+        else:
+            self.convert_btn.config(state="normal")
+            self.save_btn.config(state="disabled")
+            self.play_btn.config(state="disabled")
+            self.pause_btn.config(state="disabled")
+            self.stop_btn.config(state="disabled")
+            self.play_all_btn.config(state="disabled")
+    
+    def cleanup_temp_files(self):
+        """清理临时文件"""
+        for temp_file in self.temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except:
+                pass
+        self.temp_files.clear()
+    
+    def on_closing(self):
+        """程序关闭时清理"""
+        self.stop_play()
+        self.cleanup_temp_files()
+        pygame.mixer.quit()
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = TTSReader(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.mainloop()
+
